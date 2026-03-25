@@ -31,6 +31,19 @@ def directory_check(path):
         return False
 
 
+def list_files_recursive(path='.'):
+    for entry in os.listdir(path):
+        full_path = os.path.join(path, entry)
+        if os.path.isdir(full_path):
+            list_files_recursive(full_path)
+        else:
+            print(f"Plik: {full_path}")
+            wynikowy_hash = hash(entry, path)
+            if wynikowy_hash:
+                print(f"Hash pliku {entry} wynosi: {wynikowy_hash}")
+            print("###################################")
+
+
 def main():
     context = pyudev.Context()
     monitor = pyudev.Monitor.from_netlink(context)
@@ -87,35 +100,7 @@ def main():
                         foldery = os.listdir(punkt_mnt)
 
                         print("Pendrive zawiera następujące pliki:")
-                        for n in foldery:
-                            print(n)
-
-                        print("###################################")
-                        print("Obliczanie hashy:")
-                        print("###################################")
-
-                        for k in foldery:
-                            full_path = os.path.join(punkt_mnt, k)
-
-                            if directory_check(full_path):
-                                print(f"{k} to katalog")
-                                print("###################################")
-                                foldery2 = os.listdir(full_path)
-                                try:
-                                    for p in foldery2:
-                                        print(
-                                            "###################################")
-                                        print("Obliczanie hashy:")
-                                        print("Listowanie katalogów: ")
-                                        print(p)
-                                except FileNotFoundError:
-                                    print("Nie ma takiego pliku")
-                                except PermissionError:
-                                    print("Brak uprawnień")
-
-                            wynikowy_hash = hash(k, punkt_mnt)
-                            print(f"Hash pliku: {k}  wynosi: {wynikowy_hash}")
-                            print("###################################")
+                        list_files_recursive(punkt_mnt)
 
                     else:
                         print(
