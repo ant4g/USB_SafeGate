@@ -2,7 +2,10 @@ import pyudev
 import os
 import subprocess
 import hashlib
+import requests
+import sys
 
+API_KEY = "tu daj swój klucz"
 
 def hash(file, base_path):
     try:
@@ -31,6 +34,41 @@ def directory_check(path):
         return False
 
 
+def Virus_Check(file_hash):
+    headers = {
+        "accept": "application/json",
+        "X-Apikey": API_KEY
+    }
+
+    url = f"https://www.virustotal.com/api/v3/search?query={file_hash}"
+
+    try:
+        response = requests.get(url, headers=headers)
+        result = response.json()
+    except Exception as e:
+        print("Błąd requesta:", e)
+        return
+
+    print("Status:", response.status_code)
+
+    malicious = 0
+
+    if response.status_code == 200 and result.get('data'):
+        try:
+            malicious = result['data'][0]['attributes']['last_analysis_stats']['malicious']
+        except KeyError:
+            print("Brak pola 'malicious' w odpowiedzi")
+    else:
+        print("Brak danych lub błąd API")
+
+    threshold = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+
+    if malicious > threshold:
+        print(f"{file_hash} -> ⚠️ MALICIOUS: {malicious}")
+    else:
+        print(f"{file_hash} -> ✅ CLEAN ({malicious})")
+
+
 def list_files_recursive(path='.'):
     for entry in os.listdir(path):
         full_path = os.path.join(path, entry)
@@ -39,9 +77,17 @@ def list_files_recursive(path='.'):
         else:
             print(f"Plik: {full_path}")
             wynikowy_hash = hash(entry, path)
+            check = Virus_Check(wynikowy_hash)
             if wynikowy_hash:
                 print(f"Hash pliku {entry} wynosi: {wynikowy_hash}")
             print("###################################")
+
+
+def API_check(id):
+    url = f'https://www.virustotal.com/api/v3/files/{id}'
+    headers = {"accept": "application/json"}
+    response = requests.get(url, headers=headers)
+    print(response.txt)
 
 
 def main():
