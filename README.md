@@ -1,52 +1,60 @@
-# SafeGate USB 🛡️🔌
+SafeGate USB 🛡️
+Izolowana Stacja Sanityzacji Nośników Danych (PoC)
 
-**Izolowana Stacja Sanityzacji Nośników Danych**
+SafeGate USB to projekt typu Proof of Concept (PoC) służący do budowy bezpiecznej „śluzy” dla nieznanych nośników USB. System automatycznie wykrywa podłączone urządzenia, izoluje je od systemu operacyjnego hosta i przekazuje do dedykowanego, odizolowanego środowiska wirtualnego w celu przeprowadzenia dogłębnej analizy bezpieczeństwa.
+🚀 Kluczowe Funkcje
 
-SafeGate USB to projekt typu Proof of Concept (PoC) mający na celu stworzenie bezpiecznej "śluzy" dla nieznanych nośników USB. System automatycznie wykrywa podłączone urządzenie, izoluje je od systemu operacyjnego hosta i przekazuje do odizolowanej maszyny wirtualnej w celu przeprowadzenia dogłębnej analizy bezpieczeństwa.
+    Automatyczna Detekcja: Wykorzystanie monitorowania jądra systemu (udev) do natychmiastowego wykrywania nowych zdarzeń na magistrali USB.
 
----
+    Izolacja Hardware-Level: Całkowita blokada automatycznego montowania (automount) na systemie hosta, co eliminuje ryzyko ataków typu autorun oraz BadUSB.
 
-## 🚀 Kluczowe Funkcje
+    Dynamiczny USB Passthrough: Automatyczne przechwytywanie i przekazywanie urządzenia do bezpiecznego środowiska Guest VM (Oracle VirtualBox).
 
-* **Automatyczna Detekcja:** Monitorowanie jądra systemu (udev) w celu natychmiastowego wykrycia nowych urządzeń USB.
-* **Izolacja Hardware-Level:** Blokada automatycznego montowania (automount) na systemie hosta, zapobiegająca atakom typu autorun/BadUSB.
-* **USB Passthrough:** Automatyczne przekazywanie urządzenia do bezpiecznego środowiska Guest VM (Oracle VirtualBox).
-* **Analiza Cloud-Based:** Automatyczne generowanie sum kontrolnych SHA-256 i weryfikacja plików za pomocą API VirusTotal.
-* **Raportowanie:** Przejrzysty werdykt o poziomie zagrożenia prezentowany użytkownikowi przed dopuszczeniem nośnika do pracy.
+    Analiza Cloud-Based: Automatyczne generowanie sum kontrolnych SHA-256 dla plików i ich weryfikacja w oparciu o silniki VirusTotal (via API).
 
-## 🏗️ Architektura Systemu
+    System Raportowania: Generowanie przejrzystego werdyktu o poziomie zagrożenia przed dopuszczeniem nośnika do użytku w sieci wewnętrznej.
 
-Projekt składa się z trzech głównych modułów:
-1.  **Host Monitor:** Skrypt Python działający jako usługa, nasłuchujący zdarzeń systemowych.
-2.  **VM Controller:** Moduł zarządzający stanem maszyny wirtualnej i tunelowaniem portów.
-3.  **Analysis Engine:** Skrypt wewnątrz VM wykonujący skanowanie i komunikację z zewnętrznymi bazami zagrożeń.
+🏗️ Architektura Systemu
 
-## 🛠️ Technologie
+System opiera się na trzech ściśle współpracujących modułach:
 
-* **Język:** Python 3.x
-* **Biblioteki:** `pyudev`, `requests`, `hashlib`
-* **Środowisko:** Linux (Ubuntu/Debian), Oracle VirtualBox
-* **API:** VirusTotal Public API
+    Host Monitor: Usługa Python działająca w tle, nasłuchująca zdarzeń systemowych udev.
 
-## 📋 Wymagania Systemowe
+    VM Controller: Moduł zarządzający cyklem życia maszyny wirtualnej i automatyzacją tunelowania portów USB.
 
-* System operacyjny Linux z dostępem do uprawnień `sudo`.
-* Zainstalowany VirtualBox wraz z Extension Pack (wymagany do obsługi kontrolerów USB 2.0/3.0).
-* Aktywny klucz API VirusTotal (Public Plan).
-* Procesor wspierający wirtualizację sprzętową (VT-x lub AMD-V).
+    Analysis Engine: Skrypt działający wewnątrz odizolowanej maszyny VM, odpowiedzialny za skanowanie zawartości i komunikację z bazami zagrożeń.
 
-## ⚠️ Bezpieczeństwo i Ryzyka
+🛠️ Stack Technologiczny
 
-Projekt ma charakter edukacyjny i prototypowy. Główne założenia opierają się na izolacji maszyn wirtualnych. Należy pamiętać o ograniczeniach darmowych planów API (limit zapytań na minutę) oraz specyfice kontrolerów USB, które mogą wpływać na stabilność procesu passthrough.
+    Język: Python 3.x
 
-## 👥 Autorzy i Role Projektowe
+    Biblioteki: pyudev, requests, hashlib
 
-Projekt został zrealizowany przez zespół w składzie:
+    Środowisko: Linux (Ubuntu/Debian), Oracle VirtualBox
 
-* Antoni Gąsiorowski – Project Manager (Zarządzanie harmonogramem, dokumentacja, testy integracyjne).
-* Szymon Stolarski – Security Administrator (Hardening hosta, konfiguracja izolacji VM, USB passthrough).
-* Kamil Wierzbicki– DevOps Engineer (Automatyzacja detekcji `udev`, skrypty sterujące VirtualBox CLI).
-* Mateusz Majcher – Backend Developer (Logika analizy plików, integracja z API VirusTotal, system raportowania).
+    API: VirusTotal API v3
 
----
-*Projekt realizowany w ramach zajęć akademickich. Budżet: 0 zł (Open Source).*
+📋 Wymagania Systemowe
+
+    System Linux z uprawnieniami sudo.
+
+    VirtualBox + Extension Pack (niezbędny do obsługi kontrolerów USB 2.0/3.0).
+
+    Klucz API VirusTotal (Public Plan).
+
+    Procesor z aktywną wirtualizacją sprzętową (VT-x lub AMD-V).
+
+⚠️ Bezpieczeństwo i Ryzyka
+
+Projekt ma charakter edukacyjno-prototypowy. Główną warstwą ochronną jest izolacja na poziomie hypervisora. Należy uwzględnić limity darmowego planu API VirusTotal oraz specyfikę kontrolerów USB, która w rzadkich przypadkach może wpływać na stabilność procesu passthrough.
+👥 Zespół projektowy
+
+Projekt został zrealizowany przez:
+
+    Antoni Gąsiorowski
+
+    Szymon Stolarski
+
+    Kamil Wierzbicki
+
+    Mateusz Majcher
