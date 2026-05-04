@@ -1,60 +1,64 @@
-SafeGate USB 🛡️
-Izolowana Stacja Sanityzacji Nośników Danych (PoC)
+# SafeGate USB 🛡️
+Isolated USB Sanitization Station (Airlock)
 
-SafeGate USB to projekt typu Proof of Concept (PoC) służący do budowy bezpiecznej „śluzy” dla nieznanych nośników USB. System automatycznie wykrywa podłączone urządzenia, izoluje je od systemu operacyjnego hosta i przekazuje do dedykowanego, odizolowanego środowiska wirtualnego w celu przeprowadzenia dogłębnej analizy bezpieczeństwa.
-🚀 Kluczowe Funkcje
+SafeGate USB is a security solution that creates a "secure airlock" for unknown USB drives. It automatically detects connected devices, isolates them from the host operating system, and passes them to a dedicated, isolated virtual machine for deep security analysis.
 
-    Automatyczna Detekcja: Wykorzystanie monitorowania jądra systemu (udev) do natychmiastowego wykrywania nowych zdarzeń na magistrali USB.
+## 🏗️ Architecture
 
-    Izolacja Hardware-Level: Całkowita blokada automatycznego montowania (automount) na systemie hosta, co eliminuje ryzyko ataków typu autorun oraz BadUSB.
+The system consists of two primary zones:
 
-    Dynamiczny USB Passthrough: Automatyczne przechwytywanie i przekazywanie urządzenia do bezpiecznego środowiska Guest VM (Oracle VirtualBox).
+1.  **The Host (Gatekeeper)**: Monitors USB insertions, prevents auto-mounting, and passes the device to the VM using `libvirt`.
+2.  **The VM (Scanner)**: Mounts the device read-only, hashes files, scans them against the VirusTotal API, generates an HTML report, and notifies the Host if the device is clean.
 
-    Analiza Cloud-Based: Automatyczne generowanie sum kontrolnych SHA-256 dla plików i ich weryfikacja w oparciu o silniki VirusTotal (via API).
+## 🛠️ Tech Stack
 
-    System Raportowania: Generowanie przejrzystego werdyktu o poziomie zagrożenia przed dopuszczeniem nośnika do użytku w sieci wewnętrznej.
+*   **Language**: Python 3.x (Object-Oriented, AsyncIO)
+*   **Networking**: Secure SSH tunnel for verdict callbacks
+*   **Virtualization**: KVM/QEMU (libvirt)
+*   **Libraries**: `httpx`, `pyudev`, `aiofiles`, `pathlib`
+*   **API**: VirusTotal API v3
 
-🏗️ Architektura Systemu
+## 🚀 Setup Instructions
 
-System opiera się na trzech ściśle współpracujących modułach:
+### 1. Host Configuration (Ubuntu VM Host)
 
-    Host Monitor: Usługa Python działająca w tle, nasłuchująca zdarzeń systemowych udev.
+1.  Clone the repository to your host.
+2.  Run the host setup script:
+    ```bash
+    sudo chmod +x setup_host.sh
+    sudo ./setup_host.sh
+    ```
+3.  **Note your private key**: The script will output an SSH private key. Save this for the VM setup.
+4.  Ensure your scanner VM is named `scanner-vm` in libvirt.
 
-    VM Controller: Moduł zarządzający cyklem życia maszyny wirtualnej i automatyzacją tunelowania portów USB.
+### 2. VM Configuration (Ubuntu Guest)
 
-    Analysis Engine: Skrypt działający wewnątrz odizolowanej maszyny VM, odpowiedzialny za skanowanie zawartości i komunikację z bazami zagrożeń.
+1.  Copy `safegate.py`, `requirements.txt`, and `setup_vm.sh` to the VM.
+2.  Run the VM setup script:
+    ```bash
+    sudo chmod +x setup_vm.sh
+    sudo ./setup_vm.sh
+    ```
+3.  **Configure SSH**: Copy the private key from the Host to `/root/.ssh/id_rsa_safegate` inside the VM.
+4.  **Set API Key**: The setup script will prompt for your VirusTotal API key.
 
-🛠️ Stack Technologiczny
+### 3. Verification
 
-    Język: Python 3.x
+1.  Start the service on the Host: `sudo python3 host_gate.py`
+2.  The VM service `safegate.service` starts automatically on boot.
+3.  Plug in a USB drive. It should disappear from the host and appear in the VM.
+4.  Check reports in `/var/www/safegate/reports` on the VM.
 
-    Biblioteki: pyudev, requests, hashlib
+## 📋 Security Features
 
-    Środowisko: Linux (Ubuntu/Debian), Oracle VirtualBox
+*   **Airlock Isolation**: Devices are never mounted by the host until they are verified.
+*   **Read-Only Analysis**: Files are scanned in a read-only state inside the VM.
+*   **Restricted Handover**: The VM communicates with the host via a restricted SSH account that can only execute the release command.
+*   **Pathlib Standard**: All file interactions use modern Python standards.
 
-    API: VirusTotal API v3
-
-📋 Wymagania Systemowe
-
-    System Linux z uprawnieniami sudo.
-
-    VirtualBox + Extension Pack (niezbędny do obsługi kontrolerów USB 2.0/3.0).
-
-    Klucz API VirusTotal (Public Plan).
-
-    Procesor z aktywną wirtualizacją sprzętową (VT-x lub AMD-V).
-
-⚠️ Bezpieczeństwo i Ryzyka
-
-Projekt ma charakter edukacyjno-prototypowy. Główną warstwą ochronną jest izolacja na poziomie hypervisora. Należy uwzględnić limity darmowego planu API VirusTotal oraz specyfikę kontrolerów USB, która w rzadkich przypadkach może wpływać na stabilność procesu passthrough.
-👥 Zespół projektowy
-
-Projekt został zrealizowany przez:
-
-    Antoni Gąsiorowski
-
-    Szymon Stolarski
-
-    Kamil Wierzbicki
-
-    Mateusz Majcher
+---
+### 👥 Project Team
+* Antoni Gąsiorowski
+* Szymon Stolarski
+* Kamil Wierzbicki
+* Mateusz Majcher
