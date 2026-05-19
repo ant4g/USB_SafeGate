@@ -92,8 +92,9 @@ class HostNotifier:
         cmd = [
             "ssh", "-i", self.ssh_key,
             "-o", "StrictHostKeyChecking=no",
+            "--",
             f"safegate-gatekeeper@{self.host_ip}",
-            f"gate-cli --{action} {serial}"
+            f"--{action} {serial}"
         ]
         try:
             subprocess.run(cmd, check=True)
@@ -113,17 +114,24 @@ class VirusTotalClient:
     async def check_hash(self, file_hash: str) -> Optional[int]:
         url = f"{self.base_url}/search?query={file_hash}"
         async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(url, headers=self.headers)
-                if response.status_code == 200:
-                    result = response.json()
-                    if result.get('data'):
-                        return result['data'][0]['attributes']['last_analysis_stats']['malicious']
-                    return 0 # Not found is assumed clean for hash search
-                else:
+            for attempt in range(5):
+                try:
+                    response = await client.get(url, headers=self.headers)
+                    if response.status_code == 200:
+                        result = response.json()
+                        if result.get('data'):
+                            return result['data'][0]['attributes']['last_analysis_stats']['malicious']
+                        return 0 # Not found is assumed clean for hash search
+                    if response.status_code == 429:
+                        wait = int(response.headers.get('Retry-After', 16))
+                        print(f"Rate limited. Sleeping {wait}s (attempt {attempt+1}/5)")
+                        await asyncio.sleep(wait)
+                        continue
                     print(f"API Error: {response.status_code}")
-            except Exception as e:
-                print(f"Request error: {e}")
+                    return None
+                except Exception as e:
+                    print(f"Request error: {e}")
+                    return None
         return None
 
 async def calculate_sha256(file_path: Path) -> Optional[str]:
@@ -171,12 +179,15 @@ class USBMonitor:
 
     def get_device_info(self, dev):
         try:
+            p = dev.properties
+            parent = dev.find_parent('block', device_type='disk') if p.get('DEVTYPE') == 'partition' else dev
+            pp = parent.properties
             sectors = int(dev.attributes.get('size', 0))
             size_gb = (sectors * 512) / (1024**3)
             return {
-                "vendor": dev.get('ID_VENDOR_FROM_DATABASE') or "Unknown",
+                "vendor": pp.get('ID_VENDOR_FROM_DATABASE') or p.get('ID_VENDOR_FROM_DATABASE') or "Unknown",
                 "size_gb": round(size_gb, 2),
-                "serial": dev.get('ID_SERIAL_SHORT') or "NoSerial",
+                "serial": pp.get('ID_SERIAL_SHORT') or p.get('ID_SERIAL_SHORT') or "NoSerial",
                 "node": dev.device_node
             }
         except (TypeError, ValueError):
@@ -189,6 +200,7 @@ class SafeGateApp:
         self.reporter = ReportGenerator()
         self.notifier = HostNotifier()
         self.threshold = threshold
+        self.vt_semaphore = asyncio.Semaphore(1)
 
     async def scan_directory(self, path: Path) -> List[Dict]:
         results = []
@@ -210,14 +222,14 @@ class SafeGateApp:
         if not file_hash:
             return None
 
-        malicious_count = await self.vt_client.check_hash(file_hash)
-        if malicious_count is None:
-            malicious_count = 0
-            
+        async with self.vt_semaphore:
+            malicious_count = await self.vt_client.check_hash(file_hash)
+            await asyncio.sleep(16)  # 4 req/min free tier ≈ 1 per 15s, buffer 16
+
         return {
             "file_path": str(file_path),
             "hash": file_hash,
-            "malicious_count": malicious_count
+            "malicious_count": malicious_count if malicious_count is not None else -1
         }
 
     async def run(self):
@@ -226,15 +238,27 @@ class SafeGateApp:
         
         while True:
             dev = await loop.run_in_executor(None, self.usb_monitor.monitor.poll, 1)
-            if dev and dev.get('ID_BUS') == 'usb' and dev.action == 'add':
+            if dev is None:
+                continue
+            p = dev.properties
+            if p.get('ID_BUS') != 'usb' or p.get('ACTION') != 'add':
+                continue
+            is_partition = p.get('DEVTYPE') == 'partition'
+            is_whole_disk_fs = p.get('DEVTYPE') == 'disk' and int(dev.attributes.get('ext_range', b'1')) == 1
+            if is_partition or is_whole_disk_fs:
                 info = self.usb_monitor.get_device_info(dev)
                 print(f"\nScanning Device: {info['vendor']} ({info['serial']})")
                 
                 if await self.usb_monitor.mount_device(info['node']):
                     scan_results = await self.scan_directory(self.usb_monitor.mount_point)
-                    
+
+                    scan_incomplete = any(r['malicious_count'] < 0 for r in scan_results)
                     max_malicious = max((r['malicious_count'] for r in scan_results), default=0)
-                    verdict = "SAFE" if max_malicious <= self.threshold else "UNSAFE"
+                    if scan_incomplete:
+                        verdict = "UNSAFE"  # fail closed: VT didn't return for at least one file
+                        print("Scan incomplete (VT errors). Failing closed.")
+                    else:
+                        verdict = "SAFE" if max_malicious <= self.threshold else "UNSAFE"
                     
                     report_path = await self.reporter.generate_html(info, scan_results, verdict)
                     print(f"Report generated: {report_path}")

@@ -9,8 +9,8 @@ fi
 echo "Setting up Host Gatekeeper..."
 
 # 1. Install dependencies
-apt-get update
-apt-get install -y python3-pyudev python3-libvirt libvirt-clients udev
+dnf update
+dnf install -y python3-pyudev python3-libvirt libvirt-client udev
 
 # 2. Create restricted user for VM callbacks
 USER="safegate-gatekeeper"
@@ -34,14 +34,42 @@ echo "command=\"python3 /opt/safegate/host_gate.py \$SSH_ORIGINAL_COMMAND\",no-p
 chmod 600 "$SSH_DIR/authorized_keys"
 chown $USER:$USER "$SSH_DIR/authorized_keys"
 
-# 4. Udev Rule to ignore USBs on Host initially
-echo 'ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{UDISKS_IGNORE}="1"' > /etc/udev/rules.d/99-safegate.rules
+# 4. Udev Rule to block USBs on Host (disks + partitions)
+cat > /etc/udev/rules.d/99-safegate.rules <<'EOF'
+# SafeGate: block all USB block devices on host (disks + partitions)
+ACTION=="add|change", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", \
+    ENV{UDISKS_IGNORE}="1", \
+    ENV{UDISKS_AUTO}="0", \
+    ENV{UDISKS_PRESENTATION_HIDE}="1", \
+    ENV{SYSTEMD_READY}="0", \
+    OWNER="root", GROUP="root", MODE="0000"
+EOF
 udevadm control --reload-rules
 udevadm trigger
 
 # 5. Allow restricted user to use virsh for the scanner-vm
 # Note: This might require adding the user to 'libvirt' group
 usermod -aG libvirt $USER
+
+# 5b. Polkit rule so libvirt group can manage system VMs without auth prompt
+cat > /etc/polkit-1/rules.d/50-safegate-libvirt.rules <<'EOF'
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.libvirt.unix.manage" && subject.isInGroup("libvirt")) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+
+# 5c. Sudoers entry: let gatekeeper run notify-send as any user without password
+cat > /etc/sudoers.d/safegate <<EOF
+$USER ALL=(ALL) NOPASSWD: /usr/bin/env, /usr/bin/notify-send, /usr/bin/wall, /usr/bin/mount, /usr/bin/umount
+EOF
+chmod 440 /etc/sudoers.d/safegate
+
+# 5d. Mount root owned by gatekeeper so it can mkdir per-serial subdirs
+mkdir -p /media/safe_usb
+chown $USER:$USER /media/safe_usb
+chmod 755 /media/safe_usb
 
 echo "--------------------------------------------------"
 echo "Host Setup Complete!"
