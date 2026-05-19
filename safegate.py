@@ -6,7 +6,7 @@ import sys
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 import httpx
 import pyudev
@@ -33,6 +33,7 @@ class ReportGenerator:
                 .verdict {{ font-size: 24px; font-weight: bold; padding: 10px; border-radius: 4px; margin: 20px 0; }}
                 .safe {{ background: #d4edda; color: #155724; }}
                 .unsafe {{ background: #f8d7da; color: #721c24; }}
+                .unknown {{ background: #fff3cd; color: #856404; }}
                 table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
                 th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
                 th {{ background: #eee; }}
@@ -53,18 +54,20 @@ class ReportGenerator:
                         <tr>
                             <th>File Path</th>
                             <th>SHA256 Hash</th>
+                            <th>VT Status</th>
                             <th>VT Malicious Hits</th>
                         </tr>
                     </thead>
                     <tbody>
         """
-        
+
         for result in scan_results:
             malicious_class = "malicious" if result['malicious_count'] > 0 else ""
             html_content += f"""
                         <tr>
                             <td>{result['file_path']}</td>
                             <td><code>{result['hash']}</code></td>
+                            <td>{result.get('status', 'FOUND')}</td>
                             <td class="{malicious_class}">{result['malicious_count']}</td>
                         </tr>
             """
@@ -111,7 +114,11 @@ class VirusTotalClient:
             "X-Apikey": self.api_key
         }
 
-    async def check_hash(self, file_hash: str) -> Optional[int]:
+    async def check_hash(self, file_hash: str) -> Optional[Tuple[str, int]]:
+        """Returns ('FOUND', n_malicious) if VT has the hash,
+        ('UNKNOWN', 0) if VT search returned no data,
+        or None on transport / API error.
+        """
         url = f"{self.base_url}/search?query={file_hash}"
         async with httpx.AsyncClient() as client:
             for attempt in range(5):
@@ -120,8 +127,9 @@ class VirusTotalClient:
                     if response.status_code == 200:
                         result = response.json()
                         if result.get('data'):
-                            return result['data'][0]['attributes']['last_analysis_stats']['malicious']
-                        return 0 # Not found is assumed clean for hash search
+                            n = result['data'][0]['attributes']['last_analysis_stats']['malicious']
+                            return ("FOUND", n)
+                        return ("UNKNOWN", 0)
                     if response.status_code == 429:
                         wait = int(response.headers.get('Retry-After', 16))
                         print(f"Rate limited. Sleeping {wait}s (attempt {attempt+1}/5)")
@@ -223,13 +231,19 @@ class SafeGateApp:
             return None
 
         async with self.vt_semaphore:
-            malicious_count = await self.vt_client.check_hash(file_hash)
+            vt_result = await self.vt_client.check_hash(file_hash)
             await asyncio.sleep(16)  # 4 req/min free tier ≈ 1 per 15s, buffer 16
+
+        if vt_result is None:
+            status, malicious_count = "ERROR", -1
+        else:
+            status, malicious_count = vt_result
 
         return {
             "file_path": str(file_path),
             "hash": file_hash,
-            "malicious_count": malicious_count if malicious_count is not None else -1
+            "status": status,
+            "malicious_count": malicious_count,
         }
 
     async def run(self):
@@ -252,20 +266,28 @@ class SafeGateApp:
                 if await self.usb_monitor.mount_device(info['node']):
                     scan_results = await self.scan_directory(self.usb_monitor.mount_point)
 
-                    scan_incomplete = any(r['malicious_count'] < 0 for r in scan_results)
-                    max_malicious = max((r['malicious_count'] for r in scan_results), default=0)
-                    if scan_incomplete:
-                        verdict = "UNSAFE"  # fail closed: VT didn't return for at least one file
+                    has_error     = any(r['status'] == "ERROR" for r in scan_results)
+                    max_malicious = max((r['malicious_count'] for r in scan_results
+                                         if r['status'] == "FOUND"), default=0)
+                    has_unknown   = any(r['status'] == "UNKNOWN" for r in scan_results)
+
+                    # Mixed precedence: UNSAFE > UNKNOWN > SAFE (ERROR fails closed → UNSAFE)
+                    if has_error:
+                        verdict = "UNSAFE"
                         print("Scan incomplete (VT errors). Failing closed.")
+                    elif max_malicious > self.threshold:
+                        verdict = "UNSAFE"
+                    elif has_unknown:
+                        verdict = "UNKNOWN"
                     else:
-                        verdict = "SAFE" if max_malicious <= self.threshold else "UNSAFE"
-                    
+                        verdict = "SAFE"
+
                     report_path = await self.reporter.generate_html(info, scan_results, verdict)
                     print(f"Report generated: {report_path}")
-                    
-                    action = "release" if verdict == "SAFE" else "block"
+
+                    action = {"SAFE": "release", "UNSAFE": "block", "UNKNOWN": "unknown"}[verdict]
                     await self.notifier.notify_host(info['serial'], action)
-                    
+
                     await self.usb_monitor.unmount_device()
                     print(f"Finished processing {info['serial']}. Verdict: {verdict}\n")
 
