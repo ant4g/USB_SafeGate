@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import grp
 import json
+import logging
 import os
 import pyudev
 import subprocess
@@ -16,6 +17,18 @@ SOCKET_PATH = Path("/run/safegate/dashboard.sock")
 SOCKET_GROUP = "safegate"
 VM_START_TIMEOUT = 120          # seconds to wait for guest-ping after virsh start
 UNKNOWN_DECISION_TIMEOUT = 300  # seconds before an UNKNOWN auto-blocks
+
+logger = logging.getLogger("host_gate")
+
+
+def configure_logging() -> None:
+    level_name = os.environ.get("SAFEGATE_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+    logger.info("Logging initialized at level=%s", logging.getLevelName(level))
 
 
 class HostGatekeeper:
@@ -42,7 +55,7 @@ class HostGatekeeper:
         }
 
     def attach_to_vm(self, info):
-        print(f"Attaching {info['serial']} to VM {self.vm_name}...")
+        logger.info("Attaching USB serial=%s to VM=%s", info['serial'], self.vm_name)
         xml = f"""
         <hostdev mode='subsystem' type='usb' managed='yes'>
           <source>
@@ -60,16 +73,17 @@ class HostGatekeeper:
                 check=True,
             )
             self.active_devices[info['serial']] = info['node']
+            logger.info("Attach successful serial=%s node=%s", info['serial'], info['node'])
             return True
         except subprocess.CalledProcessError as e:
-            print(f"Failed to attach: {e}")
+            logger.exception("Failed to attach serial=%s error=%s", info['serial'], e)
             return False
 
     def detach_from_vm(self, serial):
-        print(f"Detaching {serial} from VM...")
+        logger.info("Detaching USB serial=%s from VM=%s", serial, self.vm_name)
         xml_path = Path(f"/tmp/usb_{serial}.xml")
         if not xml_path.exists():
-            print("XML config not found, cannot detach cleanly.")
+            logger.warning("XML config missing for serial=%s; cannot detach cleanly", serial)
             return False
         try:
             subprocess.run(
@@ -77,25 +91,26 @@ class HostGatekeeper:
                  self.vm_name, str(xml_path)],
                 check=True,
             )
+            logger.info("Detach successful serial=%s", serial)
             return True
         except subprocess.CalledProcessError as e:
-            print(f"Failed to detach: {e}")
+            logger.exception("Failed to detach serial=%s error=%s", serial, e)
             return False
 
     def mount_on_host(self, serial):
         node = self.active_devices.get(serial)
         if not node:
-            print(f"Node for {serial} not found in tracking.")
+            logger.error("Node for serial=%s not found in active device tracking", serial)
             return False
         mount_path = MOUNT_ROOT / serial
         mount_path.mkdir(parents=True, exist_ok=True)
-        print(f"Mounting {node} to {mount_path}...")
+        logger.info("Mounting node=%s on host path=%s", node, mount_path)
         try:
             subprocess.run(["mount", node, str(mount_path)], check=True)
-            print(f"Device {serial} is now available at {mount_path}")
+            logger.info("Host mount successful serial=%s path=%s", serial, mount_path)
             return True
         except subprocess.CalledProcessError as e:
-            print(f"Mount failed: {e}")
+            logger.exception("Host mount failed serial=%s node=%s error=%s", serial, node, e)
             return False
 
     def virsh_state(self):
@@ -104,9 +119,11 @@ class HostGatekeeper:
                 ["virsh", "-c", "qemu:///system", "domstate", self.vm_name],
                 capture_output=True, text=True, check=False,
             )
-            return r.stdout.strip()
+            state = r.stdout.strip()
+            logger.debug("VM state check vm=%s state=%s", self.vm_name, state)
+            return state
         except Exception as e:
-            print(f"virsh domstate failed: {e}")
+            logger.exception("virsh domstate failed vm=%s error=%s", self.vm_name, e)
             return "unknown"
 
     async def ensure_vm_running(self):
@@ -130,11 +147,11 @@ class HostGatekeeper:
                 capture_output=True,
             )
             if r.returncode == 0:
-                print("VM guest agent responded.")
+                logger.info("VM guest agent responded vm=%s", self.vm_name)
                 return True
             await asyncio.sleep(2)
 
-        print("VM agent did not respond; continuing after short grace period.")
+        logger.warning("VM guest agent did not respond before timeout vm=%s", self.vm_name)
         await asyncio.sleep(5)
         return True
 
@@ -155,7 +172,7 @@ class HostGatekeeper:
                 w.close()
             except Exception:
                 pass
-        print(f"event → {event}")
+        logger.info("Broadcast event=%s", event)
 
         # Fallback: when no dashboard is connected, ping the desktop directly
         if not self.clients:
@@ -193,7 +210,7 @@ class HostGatekeeper:
                 try:
                     msg = json.loads(line.decode().strip())
                 except Exception as e:
-                    print(f"bad JSON from client: {e}")
+                    logger.warning("Bad JSON from client error=%s", e)
                     continue
                 await self.handle_action(msg)
         finally:
@@ -209,7 +226,9 @@ class HostGatekeeper:
         action = msg.get("action")
         serial = msg.get("serial")
         if not action or not serial:
+            logger.warning("Ignoring invalid action payload=%s", msg)
             return
+        logger.info("Handling action=%s serial=%s", action, serial)
 
         if action == "release":
             await self.broadcast({"event": "result", "serial": serial, "verdict": "SAFE"})
@@ -244,12 +263,12 @@ class HostGatekeeper:
                                       "msg": "mount_anyway failed"})
 
         else:
-            print(f"unknown action: {action}")
+            logger.warning("Unknown action=%s serial=%s", action, serial)
 
     async def _unknown_timeout(self, serial):
         try:
             await asyncio.sleep(UNKNOWN_DECISION_TIMEOUT)
-            print(f"UNKNOWN for {serial} timed out → auto-block")
+            logger.warning("UNKNOWN verdict timed out serial=%s, auto-blocking", serial)
             self.pending_unknown.pop(serial, None)
             self.detach_from_vm(serial)
             await self.broadcast({"event": "detached", "serial": serial,
@@ -260,7 +279,7 @@ class HostGatekeeper:
     # ---------- udev loop ----------
 
     async def udev_loop(self):
-        print("Host Gatekeeper active. Monitoring for USB insertions...")
+        logger.info("Host Gatekeeper active; monitoring for USB insertions")
         loop = asyncio.get_event_loop()
         while True:
             device = await loop.run_in_executor(None, self.monitor.poll, 1)
@@ -271,7 +290,13 @@ class HostGatekeeper:
             info = self.get_usb_info(device)
             if not info:
                 continue
-            print(f"Detected USB: {info['vendor']}:{info['product']} ({info['serial']})")
+            logger.info(
+                "USB detected vendor=%s product=%s serial=%s node=%s",
+                info['vendor'],
+                info['product'],
+                info['serial'],
+                info['node'],
+            )
             await self.broadcast({"event": "detected", **info})
             await self.broadcast({"event": "vm_starting", "serial": info['serial']})
             if not await self.ensure_vm_running():
@@ -296,7 +321,7 @@ class HostGatekeeper:
             os.chown(SOCKET_PATH.parent, 0, gid)
             os.chmod(SOCKET_PATH.parent, 0o2770)
         except KeyError:
-            print(f"group {SOCKET_GROUP} not found; parent dir left as-is")
+            logger.warning("Group %s not found; socket parent left as-is", SOCKET_GROUP)
             gid = None
 
         if SOCKET_PATH.exists():
@@ -305,7 +330,7 @@ class HostGatekeeper:
         if gid is not None:
             os.chown(SOCKET_PATH, 0, gid)
         os.chmod(SOCKET_PATH, 0o660)
-        print(f"IPC socket listening at {SOCKET_PATH}")
+        logger.info("IPC socket listening path=%s", SOCKET_PATH)
 
         async with server:
             await self.udev_loop()
@@ -349,7 +374,7 @@ def notify_desktop(summary: str, body: str, urgency: str = "normal"):
         if not notified:
             subprocess.run(["wall", f"{summary}: {body}"], check=False)
     except Exception as e:
-        print(f"notify_desktop error: {e}")
+        logger.exception("notify_desktop error=%s", e)
 
 
 # ---------- Thin CLI client (used by VM SSH forced-command) ----------
@@ -364,7 +389,7 @@ def send_to_daemon(payload: dict):
         s.close()
         return True
     except Exception as e:
-        print(f"Failed to reach daemon socket: {e}")
+        logger.exception("Failed to reach daemon socket path=%s error=%s", SOCKET_PATH, e)
         return False
 
 
@@ -387,7 +412,9 @@ def cli():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
+        configure_logging()
         cli()
     else:
+        configure_logging()
         gate = HostGatekeeper(VM_NAME)
         asyncio.run(gate.run())
