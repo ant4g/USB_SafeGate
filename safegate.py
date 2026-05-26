@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import logging
 import os
 import subprocess
 import sys
@@ -11,6 +12,19 @@ from typing import Optional, List, Dict, Tuple
 import httpx
 import pyudev
 import aiofiles
+
+logger = logging.getLogger("safegate")
+
+
+def configure_logging() -> None:
+    level_name = os.environ.get("SAFEGATE_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+    logger.info("Logging initialized at level=%s", logging.getLevelName(level))
+
 
 class ReportGenerator:
     def __init__(self, report_dir: Path = Path("/var/www/safegate/reports")):
@@ -100,10 +114,11 @@ class HostNotifier:
             f"--{action} {serial}"
         ]
         try:
+            logger.info("Notifying host action=%s serial=%s", action, serial)
             subprocess.run(cmd, check=True)
-            print(f"Notified host: {action} {serial}")
+            logger.info("Host notification sent successfully action=%s serial=%s", action, serial)
         except subprocess.CalledProcessError as e:
-            print(f"Failed to notify host: {e}")
+            logger.exception("Failed to notify host action=%s serial=%s error=%s", action, serial, e)
 
 class VirusTotalClient:
     def __init__(self, api_key: str):
@@ -123,27 +138,41 @@ class VirusTotalClient:
         async with httpx.AsyncClient() as client:
             for attempt in range(5):
                 try:
+                    logger.info("VirusTotal lookup hash=%s attempt=%d/5", file_hash, attempt + 1)
                     response = await client.get(url, headers=self.headers)
                     if response.status_code == 200:
                         result = response.json()
                         if result.get('data'):
                             n = result['data'][0]['attributes']['last_analysis_stats']['malicious']
+                            logger.info("VirusTotal result hash=%s status=FOUND malicious=%d", file_hash, n)
                             return ("FOUND", n)
+                        logger.info("VirusTotal result hash=%s status=UNKNOWN", file_hash)
                         return ("UNKNOWN", 0)
                     if response.status_code == 429:
                         wait = int(response.headers.get('Retry-After', 16))
-                        print(f"Rate limited. Sleeping {wait}s (attempt {attempt+1}/5)")
+                        logger.warning(
+                            "VirusTotal rate limited hash=%s wait=%ss attempt=%d/5",
+                            file_hash,
+                            wait,
+                            attempt + 1,
+                        )
                         await asyncio.sleep(wait)
                         continue
-                    print(f"API Error: {response.status_code}")
+                    logger.error(
+                        "VirusTotal API error hash=%s status_code=%s body=%s",
+                        file_hash,
+                        response.status_code,
+                        response.text[:500],
+                    )
                     return None
                 except Exception as e:
-                    print(f"Request error: {e}")
+                    logger.exception("VirusTotal request error hash=%s error=%s", file_hash, e)
                     return None
         return None
 
 async def calculate_sha256(file_path: Path) -> Optional[str]:
     try:
+        logger.info("Hashing started file=%s", file_path)
         sha256_hash = hashlib.sha256()
         async with aiofiles.open(file_path, mode='rb') as f:
             while True:
@@ -151,9 +180,11 @@ async def calculate_sha256(file_path: Path) -> Optional[str]:
                 if not chunk:
                     break
                 sha256_hash.update(chunk)
-        return sha256_hash.hexdigest()
+        digest = sha256_hash.hexdigest()
+        logger.info("Hashing finished file=%s sha256=%s", file_path, digest)
+        return digest
     except Exception as e:
-        print(f"Hashing error for {file_path}: {e}")
+        logger.exception("Hashing error file=%s error=%s", file_path, e)
         return None
 
 class USBMonitor:
@@ -167,22 +198,25 @@ class USBMonitor:
 
     async def mount_device(self, device_node: str) -> bool:
         try:
-            print(f"Attempting to mount {device_node} as read-only...")
+            logger.info("Attempting to mount device=%s read-only at=%s", device_node, self.mount_point)
             subprocess.run(
                 ["sudo", "mount", "-o", "ro", device_node, str(self.mount_point)],
                 check=True
             )
+            logger.info("Mount successful device=%s mount_point=%s", device_node, self.mount_point)
             return True
         except subprocess.CalledProcessError as e:
-            print(f"Mount error: {e}")
+            logger.exception("Mount error device=%s error=%s", device_node, e)
             return False
 
     async def unmount_device(self) -> bool:
         try:
             subprocess.run(["sudo", "umount", str(self.mount_point)], check=True)
+            logger.info("Unmount successful mount_point=%s", self.mount_point)
             return True
         except subprocess.CalledProcessError as e:
             # Often fails if already unmounted
+            logger.warning("Unmount failed mount_point=%s error=%s", self.mount_point, e)
             return False
 
     def get_device_info(self, dev):
@@ -212,10 +246,10 @@ class SafeGateApp:
 
     async def scan_directory(self, path: Path) -> List[Dict]:
         results = []
-        tasks = []
         
         # Collect all files first
         files_to_scan = [p for p in path.rglob('*') if p.is_file()]
+        logger.info("Discovered %d files to scan under %s", len(files_to_scan), path)
         
         async def process_task(file_path):
             res = await self.process_file(file_path)
@@ -228,9 +262,11 @@ class SafeGateApp:
     async def process_file(self, file_path: Path) -> Optional[Dict]:
         file_hash = await calculate_sha256(file_path)
         if not file_hash:
+            logger.error("Skipping file due to hashing failure file=%s", file_path)
             return None
 
         async with self.vt_semaphore:
+            logger.info("Submitting file to VirusTotal hash lookup file=%s hash=%s", file_path, file_hash)
             vt_result = await self.vt_client.check_hash(file_hash)
             await asyncio.sleep(16)  # 4 req/min free tier ≈ 1 per 15s, buffer 16
 
@@ -238,6 +274,12 @@ class SafeGateApp:
             status, malicious_count = "ERROR", -1
         else:
             status, malicious_count = vt_result
+        logger.info(
+            "Scan result file=%s status=%s malicious_count=%s",
+            file_path,
+            status,
+            malicious_count,
+        )
 
         return {
             "file_path": str(file_path),
@@ -247,7 +289,7 @@ class SafeGateApp:
         }
 
     async def run(self):
-        print("SafeGate Scanner is active. Waiting for USB passthrough...")
+        logger.info("SafeGate scanner active; waiting for USB passthrough events")
         loop = asyncio.get_event_loop()
         
         while True:
@@ -261,7 +303,12 @@ class SafeGateApp:
             is_whole_disk_fs = p.get('DEVTYPE') == 'disk' and int(dev.attributes.get('ext_range', b'1')) == 1
             if is_partition or is_whole_disk_fs:
                 info = self.usb_monitor.get_device_info(dev)
-                print(f"\nScanning Device: {info['vendor']} ({info['serial']})")
+                logger.info(
+                    "USB candidate detected vendor=%s serial=%s node=%s",
+                    info['vendor'],
+                    info['serial'],
+                    info['node'],
+                )
                 
                 if await self.usb_monitor.mount_device(info['node']):
                     scan_results = await self.scan_directory(self.usb_monitor.mount_point)
@@ -274,7 +321,7 @@ class SafeGateApp:
                     # Mixed precedence: UNSAFE > UNKNOWN > SAFE (ERROR fails closed → UNSAFE)
                     if has_error:
                         verdict = "UNSAFE"
-                        print("Scan incomplete (VT errors). Failing closed.")
+                        logger.warning("Scan incomplete due to VirusTotal errors; failing closed")
                     elif max_malicious > self.threshold:
                         verdict = "UNSAFE"
                     elif has_unknown:
@@ -283,21 +330,23 @@ class SafeGateApp:
                         verdict = "SAFE"
 
                     report_path = await self.reporter.generate_html(info, scan_results, verdict)
-                    print(f"Report generated: {report_path}")
+                    logger.info("Report generated path=%s", report_path)
 
                     action = {"SAFE": "release", "UNSAFE": "block", "UNKNOWN": "unknown"}[verdict]
                     await self.notifier.notify_host(info['serial'], action)
 
                     await self.usb_monitor.unmount_device()
-                    print(f"Finished processing {info['serial']}. Verdict: {verdict}\n")
+                    logger.info("Finished processing serial=%s verdict=%s", info['serial'], verdict)
 
 async def main():
+    configure_logging()
     api_key = os.environ.get("VIRUSTOTAL_API_KEY")
     if not api_key:
-        print("Error: VIRUSTOTAL_API_KEY not set.")
+        logger.error("VIRUSTOTAL_API_KEY not set")
         sys.exit(1)
         
     threshold = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    logger.info("Starting SafeGate app with threshold=%d", threshold)
     app = SafeGateApp(api_key, threshold)
     await app.run()
 
@@ -305,4 +354,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nStopping SafeGate...")
+        logger.info("Stopping SafeGate on keyboard interrupt")
