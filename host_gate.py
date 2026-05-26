@@ -134,10 +134,15 @@ class HostGatekeeper:
                 subprocess.run(
                     ["virsh", "-c", "qemu:///system", "start", self.vm_name],
                     check=True,
+                    capture_output=True,
+                    text=True,
                 )
             except subprocess.CalledProcessError as e:
-                logger.exception("VM start failed vm=%s error=%s", self.vm_name, e)
-                return False
+                if "already active" in (e.stderr or "") or "already active" in (e.stdout or ""):
+                    logger.info("VM %s was already active", self.vm_name)
+                else:
+                    logger.exception("VM start failed vm=%s error=%s", self.vm_name, e)
+                    return False
 
         deadline = time.time() + VM_START_TIMEOUT
         while time.time() < deadline:
