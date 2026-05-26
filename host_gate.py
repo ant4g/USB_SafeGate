@@ -129,14 +129,14 @@ class HostGatekeeper:
     async def ensure_vm_running(self):
         state = self.virsh_state()
         if state != "running":
-            print(f"VM {self.vm_name} state='{state}', starting...")
+            logger.info("VM %s state='%s', starting...", self.vm_name, state)
             try:
                 subprocess.run(
                     ["virsh", "-c", "qemu:///system", "start", self.vm_name],
                     check=True,
                 )
             except subprocess.CalledProcessError as e:
-                print(f"VM start failed: {e}")
+                logger.exception("VM start failed vm=%s error=%s", self.vm_name, e)
                 return False
 
         deadline = time.time() + VM_START_TIMEOUT
