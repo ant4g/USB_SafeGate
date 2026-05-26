@@ -47,9 +47,10 @@ Description=USB SafeGate Scanner
 After=network.target
 
 [Service]
+Environment=PYTHONUNBUFFERED=1
 Type=simple
 User=root
-WorkingDirectory=$INSTALL_DIR
+WorkingDirectory=/opt/safegate
 ExecStart=$INSTALL_DIR/venv/bin/python3 $INSTALL_DIR/safegate.py
 EnvironmentFile=/etc/safegate.env
 Restart=always
