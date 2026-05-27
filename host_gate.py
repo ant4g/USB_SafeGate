@@ -44,7 +44,7 @@ class HostGatekeeper:
         self.scanned_serials = self._load_scanned_serials()
         self.last_event_time = {}       # serial -> timestamp
 
-    def _load_scanned_serials(self) -> Dict[str, str]:
+    def _load_scanned_serials(self):
         try:
             if SCANNED_DB.exists():
                 with open(SCANNED_DB, 'r') as f:
@@ -197,7 +197,11 @@ class HostGatekeeper:
             try:
                 w.write(line)
                 await w.drain()
-            except Exception:
+            except (ConnectionResetError, BrokenPipeError):
+                logger.info("Client connection lost during broadcast")
+                dead.append(w)
+            except Exception as e:
+                logger.warning("Error broadcasting to client: %s", e)
                 dead.append(w)
         for w in dead:
             self.clients.discard(w)
@@ -237,7 +241,11 @@ class HostGatekeeper:
         self.clients.add(writer)
         try:
             while True:
-                line = await reader.readline()
+                try:
+                    line = await reader.readline()
+                except (ConnectionError, OSError):
+                    logger.info("Client disconnected unexpectedly")
+                    break
                 if not line:
                     break
                 try:
@@ -250,6 +258,7 @@ class HostGatekeeper:
             self.clients.discard(writer)
             try:
                 writer.close()
+                await writer.wait_closed()
             except Exception:
                 pass
 
