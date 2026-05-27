@@ -14,6 +14,7 @@ from pathlib import Path
 VM_NAME = "scanner-vm"
 MOUNT_ROOT = Path("/media/safe_usb")
 SOCKET_PATH = Path("/run/safegate/dashboard.sock")
+SCANNED_DB = Path("/var/lib/safegate/scanned_serials.json")
 SOCKET_GROUP = "safegate"
 VM_START_TIMEOUT = 120          # seconds to wait for guest-ping after virsh start
 UNKNOWN_DECISION_TIMEOUT = 300  # seconds before an UNKNOWN auto-blocks
@@ -40,6 +41,29 @@ class HostGatekeeper:
         self.active_devices = {}     # serial -> device_node
         self.pending_unknown = {}    # serial -> {"info":..., "task": asyncio.Task}
         self.clients = set()         # set[asyncio.StreamWriter]
+        self.scanned_serials = self._load_scanned_serials()
+        self.last_event_time = {}       # serial -> timestamp
+
+    def _load_scanned_serials(self) -> Dict[str, str]:
+        try:
+            if SCANNED_DB.exists():
+                with open(SCANNED_DB, 'r') as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return {s: "UNKNOWN" for s in data}
+                    return data
+        except Exception as e:
+            logger.error("Failed to load scanned serials db: %s", e)
+        return {}
+
+    def _save_scanned_serial(self, serial: str, verdict: str):
+        self.scanned_serials[serial] = verdict
+        try:
+            SCANNED_DB.parent.mkdir(parents=True, exist_ok=True)
+            with open(SCANNED_DB, 'w') as f:
+                json.dump(self.scanned_serials, f)
+        except Exception as e:
+            logger.error("Failed to save scanned serial %s with verdict %s: %s", serial, verdict, e)
 
     # ---------- USB / libvirt ----------
 
@@ -118,6 +142,7 @@ class HostGatekeeper:
             r = subprocess.run(
                 ["virsh", "-c", "qemu:///system", "domstate", self.vm_name],
                 capture_output=True, text=True, check=False,
+                env={**os.environ, "LC_ALL": "C"},
             )
             state = r.stdout.strip()
             logger.debug("VM state check vm=%s state=%s", self.vm_name, state)
@@ -128,21 +153,24 @@ class HostGatekeeper:
 
     async def ensure_vm_running(self):
         state = self.virsh_state()
-        if state != "running":
-            logger.info("VM %s state='%s', starting...", self.vm_name, state)
-            try:
-                subprocess.run(
-                    ["virsh", "-c", "qemu:///system", "start", self.vm_name],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-            except subprocess.CalledProcessError as e:
-                if "already active" in (e.stderr or "") or "already active" in (e.stdout or ""):
-                    logger.info("VM %s was already active", self.vm_name)
-                else:
-                    logger.exception("VM start failed vm=%s error=%s", self.vm_name, e)
-                    return False
+        if state == "running":
+            return True
+            
+        logger.info("VM %s state='%s', starting...", self.vm_name, state)
+        try:
+            subprocess.run(
+                ["virsh", "-c", "qemu:///system", "start", self.vm_name],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "LC_ALL": "C"},
+            )
+        except subprocess.CalledProcessError as e:
+            if "already active" in (e.stderr or "") or "already active" in (e.stdout or ""):
+                logger.info("VM %s was already active", self.vm_name)
+            else:
+                logger.exception("VM start failed vm=%s error=%s", self.vm_name, e)
+                return False
 
         deadline = time.time() + VM_START_TIMEOUT
         while time.time() < deadline:
@@ -237,15 +265,22 @@ class HostGatekeeper:
 
         if action == "release":
             await self.broadcast({"event": "result", "serial": serial, "verdict": "SAFE"})
-            if self.detach_from_vm(serial) and self.mount_on_host(serial):
+            self._save_scanned_serial(serial, "SAFE")
+            
+            detached = True
+            if serial in self.active_devices:
+                detached = self.detach_from_vm(serial)
+            
+            if detached and self.mount_on_host(serial):
                 await self.broadcast({"event": "mounted", "serial": serial,
-                                      "path": str(MOUNT_ROOT / serial)})
+                                       "path": str(MOUNT_ROOT / serial)})
             else:
                 await self.broadcast({"event": "error", "serial": serial,
-                                      "msg": "release path failed"})
+                                       "msg": "release path failed"})
 
         elif action == "block":
             await self.broadcast({"event": "result", "serial": serial, "verdict": "UNSAFE"})
+            self._save_scanned_serial(serial, "UNSAFE")
             self.detach_from_vm(serial)
             await self.broadcast({"event": "detached", "serial": serial})
             self.pending_unknown.pop(serial, None)
@@ -275,9 +310,10 @@ class HostGatekeeper:
             await asyncio.sleep(UNKNOWN_DECISION_TIMEOUT)
             logger.warning("UNKNOWN verdict timed out serial=%s, auto-blocking", serial)
             self.pending_unknown.pop(serial, None)
+            self._save_scanned_serial(serial, "UNSAFE")
             self.detach_from_vm(serial)
             await self.broadcast({"event": "detached", "serial": serial,
-                                  "msg": "auto-block (timeout)"})
+                                   "msg": "auto-block (timeout)"})
         except asyncio.CancelledError:
             pass
 
@@ -295,6 +331,20 @@ class HostGatekeeper:
             info = self.get_usb_info(device)
             if not info:
                 continue
+            
+            serial = info['serial']
+            now = time.time()
+            if serial in self.last_event_time and now - self.last_event_time[serial] < 10:
+                logger.debug("Debouncing duplicate event for serial=%s", serial)
+                continue
+            self.last_event_time[serial] = now
+
+            if serial in self.scanned_serials:
+                verdict = self.scanned_serials[serial]
+                logger.info("USB %s previously scanned as %s, skipping analysis", serial, verdict)
+                await self.broadcast({"event": "result", "serial": serial, "verdict": verdict, "msg": "Previously verified"})
+                continue
+
             logger.info(
                 "USB detected vendor=%s product=%s serial=%s node=%s",
                 info['vendor'],
