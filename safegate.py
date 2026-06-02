@@ -223,7 +223,7 @@ class USBMonitor:
         try:
             p = dev.properties
             parent = dev.find_parent('block', device_type='disk') if p.get('DEVTYPE') == 'partition' else dev
-            pp = parent.properties
+            pp = parent.properties if parent else p
             sectors = int(dev.attributes.get('size', 0))
             size_gb = (sectors * 512) / (1024**3)
             return {
